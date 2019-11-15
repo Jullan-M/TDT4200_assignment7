@@ -11,8 +11,8 @@ extern "C" {
 #define ERROR_EXIT -1
 
 /* Divide the problem into blocks of BLOCKX x BLOCKY threads */
-#define BLOCKY 32
-#define BLOCKX 32
+#define BLOCKY 16
+#define BLOCKX 16
 
 
 /* Problem size */
@@ -98,7 +98,8 @@ void host_applyFilter(unsigned char **out, unsigned char **in, unsigned int widt
       aggregate *= filterFactor;
       if (aggregate > 0) {
         out[y][x] = (aggregate > 255) ? 255 : aggregate;
-      } else {
+      }
+      else {
         out[y][x] = 0;
       }
     }
@@ -144,8 +145,8 @@ __global__ void s_device_applyFilter(unsigned char *out, unsigned char *in, unsi
 			s_filter[PIXEL(threadIdx.x, threadIdx.y, filterDim)] = filter[PIXEL(threadIdx.x, threadIdx.y, filterDim)];
 	}
 
-	//__shared__ unsigned char s_in[BLOCKX * BLOCKY];
-	//s_in[PIXEL(threadIdx.x, threadIdx.y , BLOCKX)] = in[PIXEL(x, y, width)];
+	__shared__ unsigned char s_in[BLOCKX * BLOCKY];
+	s_in[PIXEL(threadIdx.x, threadIdx.y , BLOCKX)] = in[PIXEL(x, y, width)];
 
 
 	int aggregate = 0;
@@ -157,10 +158,10 @@ __global__ void s_device_applyFilter(unsigned char *out, unsigned char *in, unsi
 		for (unsigned int kx = 0; kx < filterDim; kx++) {
 			int nkx = filterDim - 1 - kx;
 			int dx = kx - filterCenter;
-			//if (threadIdx.x >= filterCenter && threadIdx.x < BLOCKX - filterCenter && threadIdx.y >= filterCenter && threadIdx.y < BLOCKY - filterCenter) {
-			//	aggregate += s_in[PIXEL(threadIdx.x + dx, threadIdx.y + dy , BLOCKX)] * s_filter[nky * filterDim + nkx];
-			//	continue;
-			//}
+			if (threadIdx.x >= filterCenter && threadIdx.x < BLOCKX - filterCenter && threadIdx.y >= filterCenter && threadIdx.y < BLOCKY - filterCenter) {
+				aggregate += s_in[PIXEL(threadIdx.x + dx, threadIdx.y + dy , BLOCKX)] * s_filter[nky * filterDim + nkx];
+				continue;
+			}
 
 			int xx = x + dx;
 			if (xx >= 0 && xx < (int) width && yy >=0 && yy < (int) height) {
@@ -301,6 +302,16 @@ int main(int argc, char **argv) {
 	double start;
 	double hosttime=0;
 	double devicetime=0;
+	double s_devicetime=0;
+
+	// Initialize device memory for GPU processing.
+	unsigned char *devChannel; // Resultant array
+	unsigned char *s_devChannel; // Resultant array
+	cudaErrorCheck(cudaMalloc((void **) &devChannel, im_XSIZE * im_YSIZE));
+	cudaErrorCheck(cudaMalloc((void **) &s_devChannel, im_XSIZE * im_YSIZE));
+	// Copy the memory data from original host imageChannel to device memory.
+	cudaErrorCheck(cudaMemcpy(devChannel, imageChannel->rawdata, im_XSIZE * im_YSIZE, cudaMemcpyHostToDevice));
+	cudaErrorCheck(cudaMemcpy(s_devChannel, imageChannel->rawdata, im_XSIZE * im_YSIZE, cudaMemcpyHostToDevice));
 
 	/*																					*/
 	/*									CPU PROCESSING									*/
@@ -313,7 +324,7 @@ int main(int argc, char **argv) {
 	//Here we do the actual computation!
 	// Host computation
 	start = walltime();
-	for (unsigned int i = 0; i < 0; i ++) {
+	for (unsigned int i = 0; i < iterations; i ++) {
 		host_applyFilter(processImageChannel->data,
 				imageChannel->data,
 				im_XSIZE,
@@ -339,17 +350,13 @@ int main(int argc, char **argv) {
 	/*																					*/
 	/*									GPU PROCESSING									*/
 	/*																					*/
-	// Initialize device memory for GPU processing.
-	unsigned char *devChannel; // Resultant array
+
 	unsigned char *devProcChannel; // Imageprocessing array
 	int *devKernel;	// Filter array (Laplacian1 filter)
 
-	cudaErrorCheck(cudaMalloc((void **) &devChannel, im_XSIZE * im_YSIZE));
+
 	cudaErrorCheck(cudaMalloc((void **) &devProcChannel, im_XSIZE * im_YSIZE));
 	cudaErrorCheck(cudaMalloc((void **) &devKernel, kerDim * kerDim * sizeof(int)));
-
-	// Copy the memory data from original host imageChannel to device memory.
-	cudaErrorCheck(cudaMemcpy(devChannel, imageChannel->rawdata, im_XSIZE * im_YSIZE, cudaMemcpyHostToDevice));
 
 	// Copy the kernel data from host to device memory.
 	cudaErrorCheck(cudaMemcpy(devKernel, laplacian1Filter, kerDim * kerDim * sizeof(int), cudaMemcpyHostToDevice));
@@ -360,7 +367,7 @@ int main(int argc, char **argv) {
 	// Device computation
 	start = walltime();
 	for (unsigned int i = 0; i < iterations; i ++) {
-		s_device_applyFilter<<<gridBlock, threadBlock>>>(devProcChannel,
+		device_applyFilter<<<gridBlock, threadBlock>>>(devProcChannel,
 					devChannel,
 					im_XSIZE,
 					im_YSIZE,
@@ -374,45 +381,90 @@ int main(int argc, char **argv) {
 		devChannel = tmp2;
 	}
 	devicetime = walltime() - start;
-	// Free device memory used in processing
-	cudaFree(devProcChannel);
-	cudaFree(devKernel);
 
 	// Initialize host memory for GPU processed image
 	bmpImageChannel *gpuImageChannel = newBmpImageChannel(im_XSIZE, im_YSIZE);
 
 	// Copy processed image memory from device to host
 	cudaMemcpy(gpuImageChannel->rawdata, devChannel, im_XSIZE * im_YSIZE, cudaMemcpyDeviceToHost);
-	
+
+	// Free memory from device
 	cudaFree(devChannel);
 
-	int errors=0;
+	//	SHARED MEMORY
+	start = walltime();
+	for (unsigned int i = 0; i < iterations; i ++) {
+			s_device_applyFilter<<<gridBlock, threadBlock>>>(devProcChannel,
+						s_devChannel,
+						im_XSIZE,
+						im_YSIZE,
+						devKernel, kerDim, laplacian1FilterFactor
+						);
+			cudaErrorCheck(cudaGetLastError());
+
+			//Swap the data pointers
+			unsigned char *tmp3 = devProcChannel;
+			devProcChannel = s_devChannel;
+			s_devChannel = tmp3;
+	}
+	s_devicetime = walltime() - start;
+
+	// Initialize host memory for GPU processed image
+	bmpImageChannel *s_gpuImageChannel = newBmpImageChannel(im_XSIZE, im_YSIZE);
+
+	// Copy processed image memory from device to host
+	cudaMemcpy(s_gpuImageChannel->rawdata, s_devChannel, im_XSIZE * im_YSIZE, cudaMemcpyDeviceToHost);
+
+	// Free device memory used in processing
+	cudaFree(devProcChannel);
+	cudaFree(devKernel);
+	cudaFree(s_devChannel);
+
+	
+	int errors1=0;
+	int errors2=0;
 	/* check if result is correct */
 	for(unsigned int k = 0; k<im_XSIZE * im_YSIZE; k++) {
 		if (imageChannel->rawdata[k] != gpuImageChannel->rawdata[k]) {
-			errors++;
+			errors1++;
 		}
 	}
 	
-	if(errors>0) {
-		printf("Found %d errors of the %d pixels.\n",errors, im_XSIZE * im_YSIZE);
+	for(unsigned int k = 0; k<im_XSIZE * im_YSIZE; k++) {
+		if (imageChannel->rawdata[k] != s_gpuImageChannel->rawdata[k]) {
+			errors2++;
+		}
+	}
+
+	printf("____BASIC CUDA CODE____\n");
+	if(errors1>0) {
+		printf("Found %d errors of the %d pixels.\n",errors1, im_XSIZE * im_YSIZE);
+	}
+	else {
+		puts("Device calculations are correct.");
+	}
+
+	printf("\n____CUDA CODE UTILIZING SHARED MEMORY____\n");
+	if(errors2>0) {
+		printf("Found %d errors of the %d pixels.\n",errors2, im_XSIZE * im_YSIZE);
 	}
 	else {
 		puts("Device calculations are correct.");
 	}
 
 	printf("\n");
-	printf("Host time:          %7.5f ms\n",hosttime*1e3);
-	printf("Device calculation: %7.5f ms\n",devicetime*1e3);
+	printf("Host time:\t%7.5f ms\n",hosttime*1e3);
+	printf("GPU basic:\t %7.5f ms\n",devicetime*1e3);
+	printf("GPU shared mem:\t %7.5f ms\n",s_devicetime*1e3);
 
 
 	// Map our single color image back to a normal BMP image with 3 color channels
 	// mapEqual puts the color value on all three channels the same way
 	// other mapping functions are mapRed, mapGreen, mapBlue
-	if (mapImageChannel(image, gpuImageChannel, mapEqual) != 0) {
+	if (mapImageChannel(image, s_gpuImageChannel, mapEqual) != 0) {
 		fprintf(stderr, "Could not map image channel!\n");
 		freeBmpImage(image);
-		freeBmpImageChannel(gpuImageChannel);
+		freeBmpImageChannel(s_gpuImageChannel);
 		return ERROR_EXIT;
 	}
 	freeBmpImageChannel(imageChannel);
