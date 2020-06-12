@@ -11,8 +11,8 @@ extern "C" {
 #define ERROR_EXIT -1
 
 /* Divide the problem into blocks of BLOCKX x BLOCKY threads */
-#define BLOCKY 16
-#define BLOCKX 16
+#define BLOCKY 32
+#define BLOCKX 32
 
 
 /* Problem size */
@@ -109,8 +109,8 @@ void host_applyFilter(unsigned char **out, unsigned char **in, unsigned int widt
 // Apply convolutional filter on image data (GPU - basic device kernel function)
 __global__ void device_applyFilter(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
 	unsigned int const filterCenter = (filterDim / 2);
-	unsigned int y = blockIdx.y * BLOCKY + threadIdx.y;
-	unsigned int x = blockIdx.x * BLOCKX + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	
 	int aggregate = 0;
 	for (unsigned int ky = 0; ky < filterDim; ky++) {
@@ -136,8 +136,8 @@ __global__ void device_applyFilter(unsigned char *out, unsigned char *in, unsign
 // Apply convolutional filter on image data (GPU - device kernel function using shared memory)
 __global__ void s_device_applyFilter(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
 	unsigned int const filterCenter = (filterDim / 2);
-	unsigned int y = blockIdx.y * BLOCKY + threadIdx.y;
-	unsigned int x = blockIdx.x * BLOCKX + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	
 
 	__shared__ int s_filter[FILTERDIM * FILTERDIM];
@@ -360,9 +360,12 @@ int main(int argc, char **argv) {
 
 	// Copy the kernel data from host to device memory.
 	cudaErrorCheck(cudaMemcpy(devKernel, laplacian1Filter, kerDim * kerDim * sizeof(int), cudaMemcpyHostToDevice));
-
-	dim3 gridBlock(im_XSIZE / BLOCKX, im_YSIZE / BLOCKY);
+	
+	dim3 gridBlock(ceil(im_XSIZE / (float)BLOCKX), ceil(im_YSIZE / (float)BLOCKY));
 	dim3 threadBlock(BLOCKX, BLOCKY);
+
+	printf("x-blocks: %f \n", ceil(im_XSIZE / (float)BLOCKX));
+	printf("y-blocks: %f \n", ceil(im_YSIZE / (float)BLOCKY));
 
 	// Device computation
 	start = walltime();
@@ -373,7 +376,6 @@ int main(int argc, char **argv) {
 					im_YSIZE,
 					devKernel, kerDim, laplacian1FilterFactor
 					);
-		cudaErrorCheck(cudaGetLastError());
 
 		//Swap the data pointers
 		unsigned char *tmp2 = devProcChannel;
@@ -382,14 +384,17 @@ int main(int argc, char **argv) {
 	}
 	devicetime = walltime() - start;
 
+	cudaErrorCheck(cudaGetLastError());
+
 	// Initialize host memory for GPU processed image
 	bmpImageChannel *gpuImageChannel = newBmpImageChannel(im_XSIZE, im_YSIZE);
 
 	// Copy processed image memory from device to host
-	cudaMemcpy(gpuImageChannel->rawdata, devChannel, im_XSIZE * im_YSIZE, cudaMemcpyDeviceToHost);
+	cudaErrorCheck(cudaMemcpy(gpuImageChannel->rawdata, devChannel, im_XSIZE * im_YSIZE, cudaMemcpyDeviceToHost));
 
 	// Free memory from device
 	cudaFree(devChannel);
+	
 
 	//	SHARED MEMORY
 	start = walltime();
@@ -400,7 +405,6 @@ int main(int argc, char **argv) {
 						im_YSIZE,
 						devKernel, kerDim, laplacian1FilterFactor
 						);
-			cudaErrorCheck(cudaGetLastError());
 
 			//Swap the data pointers
 			unsigned char *tmp3 = devProcChannel;
@@ -409,11 +413,13 @@ int main(int argc, char **argv) {
 	}
 	s_devicetime = walltime() - start;
 
+	cudaErrorCheck(cudaGetLastError());
+
 	// Initialize host memory for GPU processed image
 	bmpImageChannel *s_gpuImageChannel = newBmpImageChannel(im_XSIZE, im_YSIZE);
 
 	// Copy processed image memory from device to host
-	cudaMemcpy(s_gpuImageChannel->rawdata, s_devChannel, im_XSIZE * im_YSIZE, cudaMemcpyDeviceToHost);
+	cudaErrorCheck(cudaMemcpy(s_gpuImageChannel->rawdata, s_devChannel, im_XSIZE * im_YSIZE, cudaMemcpyDeviceToHost));
 
 	// Free device memory used in processing
 	cudaFree(devProcChannel);
